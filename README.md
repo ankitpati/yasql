@@ -67,6 +67,11 @@ The following options are used by Makefile:
 
 * `make [options] install`
 
+* Manual
+
+Manual installation by placing `yasql.in` in a directory on your `$PATH` as
+`yasql`, with the extension stripped, and `yasql.conf` at `/usr/local/etc/`.
+
 ## Etc.
 
 Type `man yasql` for usage instructions.
