@@ -1,42 +1,39 @@
-#! /usr/bin/env perl
+#!/usr/bin/env perl
 
 use strict;
+use warnings;
+use autodie;
 
-my $perlpath = shift;
-my $bindir = shift;
-my $mandir = shift;
-my $sysconfdir = shift;
-my $version = shift;
+use POD::Man;
 
-# read in yasql
-open(YIN, "yasql.in") or die("Could not open yasql.in! $!");
-# open yasql for writing
-open(YOUT, ">yasql") or die("Could not open yasql for writing! $!");
-flock(YOUT, 2) or die("Could not flock yasql! $!");
+my ($perlpath, $bindir, $mandir, $sysconfdir, $version) = @ARGV;
 
-for(my $i = 0; <YIN>; $i++) {
-  if($i == 0) {
-    print YOUT "#!" . $perlpath . "\n";
-  } elsif(/^\$sysconfdir = /) {
-    print YOUT "\$sysconfdir = \"" . $sysconfdir . "\";\n";
-  } elsif(/^  \$VERSION = /) {
-    print YOUT "  \$VERSION = \"" . $version . "\";\n";
-  } else {
-    print YOUT;
-  }
+$perlpath   //= '/usr/bin/env perl';
+$sysconfdir //= '/usr/local/etc/';
+$version    //= '2.00';
+
+open my $yin,  '<', 'yasql.in';
+open my $yout, '>', 'yasql';
+
+for (my $i = 0; <$yin>; $i++) {
+    if ($i == 0) {
+        print $yout "#!$perlpath\n";
+    }
+    elsif (/^\$sysconfdir\s+= /) {
+        print $yout qq{\$sysconfdir = "$sysconfdir";\n};
+    }
+    elsif (/^\$VERSION\s+= /) {
+        print $yout qq{\$VERSION = "$version";\n};
+    }
+    else {
+        print $yout $_;
+    }
 }
 
-close(YOUT);
-close(YIN);
+close $yout;
+close $yin;
 
-eval {
-  require Pod::Man;
-  my $pod = Pod::Man->new(section=>1);
-  $pod->parse_from_file ('yasql', 'yasql.1');
-};
-if($@) {
-  warn "Generating man page failed, install Pod::Man to fix this"
-}
+my $pod = Pod::Man->new (section => 1);
+$pod->parse_from_file ('yasql', 'yasql.1');
 
-print "Configuration successful\n";
-
+print "Configuration successful.\n";
