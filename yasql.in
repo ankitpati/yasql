@@ -33,15 +33,17 @@
 
 use strict;
 
-use SelfLoader;
+use Getopt::Long;
+use Text::CSV;
+use Data::Dumper;
+
+use Benchmark;
+use Time::HiRes qw(gettimeofday tv_interval);
+
+use Term::ReadLine;
+use Term::ReadKey;
 
 use DBI;
-use Term::ReadLine;
-use Data::Dumper;
-use Benchmark;
-use Getopt::Long;
-
-use DBD::Oracle;
 
 # Globals
 our (
@@ -57,30 +59,19 @@ our (
     $fbuffer,         $last_fbuffer,         $quote,
     $inquotes,        $inplsqlblock,         $increate,
     $incomment,       $csv_filehandle_open,  $csv_max_lines,
-    $nohires,         $notextcsv,            $csv,
-    $sysconf,         $sysconfdir,           $quitting,
-    $sigintcaught,    %conf,                 %prompt,
-    $prompt_length,   @sqlpath,              %set,
-    $opt_batch,       $opt_notbatch,         $opt_headers,
+    $csv,             $sysconf,              $sysconfdir,
+    $quitting,        $sigintcaught,         %conf,
+    %prompt,          $prompt_length,        @sqlpath,
+    %set,             $opt_batch,            $opt_notbatch,
+    $opt_headers,
 );
 
-select( ( select(STDOUT), $| = 1 )[0] );    #unbuffer STDOUT
+$VERSION = '2.0';
 
-$sysconfdir = "/usr/local/etc";
+select ( (select (STDOUT), $| = 1)[0] );    # unbuffer STDOUT
+
+$sysconfdir = '/usr/local/etc/';
 $sysconf    = "$sysconfdir/yasql.conf";
-
-# try to include Time::HiRes for fine grained benchmarking
-eval q{
-  use Time::HiRes qw (gettimeofday tv_interval);
-};
-
-# try to include Text::CSV_XS for input and output of CSV data
-eval q{
-  use Text::CSV_XS;
-};
-if ($@) {
-    $notextcsv = 1;
-}
 
 # install signal handlers
 sub setup_sigs {
@@ -88,147 +79,96 @@ sub setup_sigs {
     $SIG{TSTP} = 'DEFAULT';
     $SIG{TERM} = \&sighandle;
 }
-setup_sigs();
-
-# install a filter on the __WARN__ handler so that we can get rid of
-# DBD::Oracle's stupid ORACLE_HOME warning.  It would warn even if we don't
-# connect using a TNS name, which doesn't require access to the ORACLE_HOME
-$SIG{__WARN__} = sub {
-    warn(@_) unless $_[0] =~ /environment variable not set!/;
-};
+setup_sigs ();
 
 # initialize the whole thing
-init();
+init ();
 
-if ($@) {
-    if ( !$opt_batch ) {
-        wrn("Time::HiRes not installed.  Please install if you want benchmark times "
-                . "to include milliseconds." );
-    }
-    $nohires = 1;
-}
-
+# we have a connection
 $connected = 1;
 
 # start the interface
-interface();
+interface ();
 
 # end
 
-################################################################################
 ###########  non-self-loaded functions  ########################################
-
-sub BEGIN {
-    $VERSION = '2.0';
-}
-
-sub argv_sort {
-    if ( $a =~ /^\@/ && $b !~ /^\@/ ) {
-        return 1;
-    }
-    elsif ( $a !~ /^\@/ && $b =~ /^\@/ ) {
-        return -1;
-    }
-    else {
-        return 0;
-    }
-}
 
 sub sighandle {
     my ($sig) = @_;
-    debugmsg( 3, "sighandle called", @_ );
+    debugmsg (3, 'sighandle called', @_);
 
     $SIG{$sig} = \&sighandle;
 
-    if ( $sig =~ /INT|TERM|TSTP/ ) {
-        if ($quitting) {
+    return unless $sig =~ /INT|TERM|TSTP/;
 
+    if ($quitting) {
         # then we've already started quitting and so we just try to force exit
         # without the graceful quit
-            print STDERR "Attempting to force exit...\n";
-            exit();
-        }
-
-        if ($sigintcaught) {
-
-            # the user has alrady hit INT and so we now force an exit
-            print STDERR "Caught another SIG$sig\n";
-            quit( undef, 1 );
-        }
-        else {
-            $sigintcaught = 1;
-        }
-
-        if ($running_query) {
-            if ( defined $cursth ) {
-                print STDERR "Attempting to cancel query...\n";
-                debugmsg( 1, "canceling statement handle" );
-                my $ret = $cursth->cancel();
-                $cursth->finish;
-            }
-        }
-        elsif ( !$connected ) {
-            quit();
-
-            if ( defined $cursth ) {
-                print STDERR "Attempting to cancel query...\n";
-                debugmsg( 1, "canceling statement handle" );
-                my $ret = $cursth->cancel();
-                $cursth->finish;
-            }
-        }
-
+        print STDERR "Attempting to force exit...\n";
+        exit;
     }
-    elsif ( $sig eq 'ALRM' ) {
+    if ($sigintcaught) {
+        # the user has alrady hit INT and so we now force an exit
+        print STDERR "Caught another SIG$sig\n";
+        quit (undef, 1);
+    }
+    else {
+        $sigintcaught = 1;
+    }
 
-        if ( defined $dbh ) {
-            wrn("Connection lost (timeout: $conf{connection_timeout})");
-            quit(1);
+    if ($running_query) {
+        if (defined $cursth) {
+            print STDERR "Attempting to cancel query...\n";
+            debugmsg (1, 'canceling statement handle');
+            my $ret = $cursth->cancel;
+            $cursth->finish;
         }
-        else {
-                err ( "Could not connect to database, timed out. (timeout: "
-                . "$conf{connection_timeout})" );
+    }
+    elsif (!$connected) {
+        quit ();
+
+        if (defined $cursth) {
+            print STDERR "Attempting to cancel query...\n";
+            debugmsg (1, 'canceling statement handle');
+            my $ret = $cursth->cancel;
+            $cursth->finish;
         }
     }
 }
 
 sub END {
-    debugmsg( 3, "END called", @_ );
+    debugmsg (3, 'END called', @_);
 
     # save the history buffer
-    if ( $term_type && $term_type eq 'gnu' && $term->history_total_bytes() ) {
-        debugmsg( 1, "Writing history" );
-        unless ( $term->WriteHistory( $conf{history_file} ) ) {
-            wrn(      "Could not write history file to $conf{history_file}.  "
-                    . "History not saved" );
+    if ($term_type && $term_type eq 'gnu' && $term->history_total_bytes) {
+        debugmsg (1, 'Writing history');
+        unless ( $term->WriteHistory ($conf{history_file}) ) {
+            wrn ("Could not write history file to $conf{history_file}.".
+                 ' History not saved');
         }
     }
 }
 
-################################################################################
 ########### self-loaded functions ##############################################
 
-#__DATA__
-
 sub init {
-
     # call GetOptions to parse the command line
     my $opt_help;
-    Getopt::Long::Configure(qw(permute));
+    Getopt::Long::Configure (qw(permute));
     $Getopt::Long::ignorecase = 0;
-    usage(1)
-        unless GetOptions(
-        "debug|d:i"         => \$opt_debug,
-        "host|H=s"          => \$opt_host,
-        "port|p=s"          => \$opt_port,
-        "sid|s=s"           => \$opt_sid,
-        "help|h|?"          => \$opt_help,
-        "nocomp|A"          => \$opt_nocomp,
-        "bench|benchmark|b" => \$opt_bench,
-        "version|V"         => \$opt_version,
-        "batch|B"           => \$opt_batch,
-        "interactive|I"     => \$opt_notbatch,
-        );
+    usage (1) unless GetOptions (
+        'debug|d:i'         => \$opt_debug,
+        'host|H=s'          => \$opt_host,
+        'port|p=s'          => \$opt_port,
+        'sid|s=s'           => \$opt_sid,
+        'help|h|?'          => \$opt_help,
+        'nocomp|A'          => \$opt_nocomp,
+        'bench|benchmark|b' => \$opt_bench,
+        'version|V'         => \$opt_version,
+        'batch|B'           => \$opt_batch,
+        'interactive|I'     => \$opt_notbatch,
+    );
 
     # set opt_debug to 1 if it's defined, which means the user just put -d or
     # --debug without an integer argument
@@ -238,44 +178,38 @@ sub init {
 
     $opt_batch = 1 unless defined $opt_batch || -t STDIN;
 
-    debugmsg( 3, "init called", @_ );
+    debugmsg (3, 'init called', @_);
 
-    # This reads the command line then initializes the DBI and Term::ReadLine
-    # packages
+    # This reads the command line then initializes DBI and Term::ReadLine
 
     $sigintcaught     = 0;
     $completion_built = 0;
 
-    usage(1) if $opt_help;
+    usage (1) if $opt_help;
 
-    # Output startup string
-    if ( !$opt_batch ) {
-        print STDERR <<"_EOC_";
+    # output startup string
+    print STDERR <<"_EOC_" unless $opt_batch;
 
 YASQL version $VERSION Copyright (c)
     2017-2018 Ankit Pati; 2000-2001 Ephibian, Inc; 2005 iMind.dev.
 
 _EOC_
-    }
 
     if ($opt_version) {
         print STDERR "\n";
-        exit(0);
+        exit 0;
     }
 
-    if ( !$opt_batch ) {
-        print STDERR "Please type 'help' for usage instructions\n";
-        print STDERR "\n";
-    }
+    print STDERR "Please type 'help' for usage instructions\n\n"
+        unless $opt_batch;
 
-    # parse the config files.  We first look for ~/.yasqlrc, then
-    # /etc/yasql.conf
     # first set up the defaults
     %conf = (
         connection_timeout      => 20,
         max_connection_attempts => 3,
-        history_file            => '~/.yasql_history',
-        pager                   => '/bin/more',
+        history_file            => "$ENV{HOME}/.yasql_history",
+        history_stifle          => -1,
+        pager                   => 'less',
         auto_commit             => 0,
         commit_on_exit          => 1,
         long_trunc_ok           => 1,
@@ -296,30 +230,31 @@ _EOC_
         server_output           => 2000,
     );
 
+    # parse the config files; first look for ~/.yasqlrc, then /etc/yasql.conf
     my $config_file;
-    if ( -e "$ENV{HOME}/.yasqlrc" ) {
+    if (-e "$ENV{HOME}/.yasqlrc") {
         $config_file = "$ENV{HOME}/.yasqlrc";
     }
-    elsif ( -e $sysconf ) {
+    elsif (-e $sysconf) {
         $config_file = $sysconf;
     }
 
     if ($config_file) {
-        debugmsg( 2, "Reading config: $config_file" );
-        open( CONFIG, "$config_file" );
-        while (<CONFIG>) {
+        debugmsg (2, "Reading config: $config_file");
+        open my $CONFIG, '<', $config_file;
+        while (<$CONFIG>) {
             chomp;
             s/#.*//;
             s/^\s+//;
             s/\s+$//;
             next unless length;
-            my ( $var, $value ) = split( /\s*=\s*/, $_, 2 );
+            my ($var, $value) = split /\s*=\s*/, $_, 2;
             $var = 'auto_commit'    if $var eq 'AutoCommit';
             $var = 'commit_on_exit' if $var eq 'CommitOnExit';
             $var = 'long_trunc_ok'  if $var eq 'LongTruncOk';
             $var = 'long_read_len'  if $var eq 'LongReadLen';
             $conf{$var} = $value;
-            debugmsg( 3, "Setting option [$var] to [$value]" );
+            debugmsg (3, "Setting option [$var] to [$value]");
         }
     }
 
@@ -332,36 +267,29 @@ _EOC_
 
     ( $conf{history_file} ) = glob( $conf{history_file} );
 
-    debugmsg( 3, "Conf: [" . Dumper( \%conf ) . "]" );
+    debugmsg (3, 'Conf: ['.debugdump (\%conf).']');
 
-    # Create a Text::CSV object
-    unless ($notextcsv) {
-        $csv = new Text::CSV_XS;
-    }
+    $csv = Text::CSV->new;
 
- # Change the process name to just 'yasql' to somewhat help with security.
- # This is not bullet proof, nor is it supported on all platforms.  Those that
- # don't support this will just fail silently.
-    debugmsg( 2, "Process name: $0" );
+    # Change the process name to just 'yasql' to hide credentials provided on
+    # the command line. This is not bullet proof, nor is it supported on all
+    # platforms. Those that don't support this will just fail silently.
+    debugmsg (2, "Process name: $0");
     $0 = 'yasql';
 
-    # Parse the SQLPATH environment variable if it exists
-    if ( $ENV{SQLPATH} ) {
-        @sqlpath = split( /;/, $ENV{SQLPATH} );
-    }
+    @sqlpath = split /;/, $ENV{SQLPATH} if exists $ENV{SQLPATH};
 
     # If the user set the SID on the command line, we'll overwrite the
     # environment variable so that DBI sees it.
-    #print "Using SID $opt_sid\n" if $opt_sid;
     $ENV{ORACLE_SID} = $opt_sid if $opt_sid;
 
     # output info about the options given
     print STDERR "Debugging is on\n" if $opt_debug;
     $opt_debug ||= 0;
-    DBI->trace(1) if $opt_debug > 3;
+    DBI->trace (1) if $opt_debug > 3;
 
   # Extending on from Oracle's conventions, try and obtain an early indication
-  # of ora_session_mode from AS SYSOPER, AS SYSDBA options.  Be flexible :-)
+  # of ora_session_mode from AS SYSOPER, AS SYSDBA options.  Be flexible.
     my $ora_session_mode = 0;
     my $osmp             = '';
     if ( lc( $ARGV[-2] || '' ) eq 'as' ) {
@@ -430,7 +358,7 @@ _EOC_
                 $connect_string );
         }
         else {
-            usage(1);
+            usage (1);
         }
 
         if ( $conf{server_output} > 0 ) {
@@ -439,11 +367,11 @@ _EOC_
         }
 
         # Quit if one or more scripts were given on the command-line
-        quit(0) if $script;
+        quit (0) if $script;
     }
 
     if ( !$opt_batch ) {
-        setup_term() unless $term;
+        setup_term () unless $term;
     }
 
     # set up the pager
@@ -451,48 +379,43 @@ _EOC_
 }
 
 sub setup_term {
-
     # set up the Term::ReadLine
-    $term = new Term::ReadLine('YASQL');
-    $term->ornaments(0);
-    $term->MinLine(0);
+    $term = Term::ReadLine->new ('YASQL');
+    $term->ornaments (0);
+    $term->MinLine (0);
 
-    debugmsg( 1, "Using " . $term->ReadLine() );
+    debugmsg (1, 'Using '.$term->ReadLine);
 
-    if ( $term->ReadLine eq 'Term::ReadLine::Gnu' ) {
-
+    if ($term->ReadLine eq 'Term::ReadLine::Gnu') {
         # Term::ReadLine::Gnu specific setup
         $term_type = 'gnu';
 
-        $attribs  = $term->Attribs();
-        $features = $term->Features();
+        $attribs  = $term->Attribs;
+        $features = $term->Features;
 
-        $term->stifle_history(500);
-        if ( $opt_debug >= 4 ) {
-            foreach ( sort keys(%$attribs) ) {
-                debugmsg( 4, "[term-attrib] $_: $attribs->{$_}" );
-            }
-            foreach ( sort keys(%$features) ) {
-                debugmsg( 4, "[term-feature] $_: $features->{$_}" );
-            }
-        }
+        $term->stifle_history
+            ($conf{history_stifle} < 0 ? undef : $conf{history_stifle});
+
+        debugmsg (4, "[term-attrib] $_: $attribs->{$_}")
+            foreach sort keys %$attribs;
+
+        debugmsg (4, "[term-feature] $_: $features->{$_}")
+            foreach sort keys %$features;
 
         # read in the ~/.yasql_history file
-        if ( -e $conf{history_file} ) {
-            unless ( $term->ReadHistory( $conf{history_file} ) ) {
-                wrn("Could not read $conf{history_file}.  History not restored"
-                );
-            }
+        if (-e $conf{history_file}) {
+            wrn ("Could not read $conf{history_file}. History not restored")
+                unless $term->ReadHistory ($conf{history_file});
         }
         else {
-            print STDERR
-                "Creating $conf{history_file} to store your command line history\n";
-            open( HISTORY, ">$conf{history_file}" )
-                or wrn("Could not create $conf{history_file}: $!");
-            close(HISTORY);
+            print STDERR "Creating $conf{history_file} to store".
+                            " your command line history\n";
+            open HISTORY, ">$conf{history_file}"
+                or wrn ("Could not create $conf{history_file}: $!");
+            close HISTORY;
         }
 
-        $last_history = $term->history_get( $term->{history_length} );
+        $last_history = $term->history_get ($term->{history_length});
 
         $attribs->{completion_entry_function} = \&complete_entry_function;
         my $completer_word_break_characters
@@ -500,207 +423,193 @@ sub setup_term {
         $completer_word_break_characters =~ s/[a-zA-Z0-9_\$\#]//g;
         $attribs->{completer_word_break_characters}
             = $completer_word_break_characters;
-
-        #$attribs->{catch_signals} = 0;
     }
-    elsif ( $term->ReadLine eq 'Term::ReadLine::Perl' ) {
-
+    elsif ($term->ReadLine eq 'Term::ReadLine::Perl') {
         # Term::ReadLine::Perl specific setup
         $term_type = 'perl';
-        if ( $opt_debug >= 4 ) {
-            foreach ( sort keys( %{ $term->Features() } ) ) {
-                debugmsg( 4, "[term-feature] $_: $attribs->{$_}" );
-            }
-        }
-
+        debugmsg (4, "[term-feature] $_: $attribs->{$_}")
+            foreach sort keys %{$term->Features};
     }
 
-    if ( $term->ReadLine eq 'Term::ReadLine::Stub' ) {
-        wrn("Neither Term::ReadLine::Gnu or Term::ReadLine::Perl are installed.\n"
-                . "Please install from CPAN for advanced functionality.  Until then "
-                . "YASQL will run\ncrippled. (like possibly not having command history "
-                . "or line editing...\n" );
-    }
+    wrn (<<'_EOM_') if $term->ReadLine eq 'Term::ReadLine::Stub';
+Neither Term::ReadLine::Gnu or Term::ReadLine::Perl are installed.
+Please install from CPAN for advanced functionality. Until then
+YASQL will run crippled, like possibly not having command history
+or line editing.
+_EOM_
 }
 
 sub parse_logon_string {
-    debugmsg( 3, "parse_logon_string called", @_ );
+    debugmsg (3, 'parse_logon_string called', @_);
 
-    my ($arg) = @_;
-    my ( $ora_session_mode, $username, $password, $connect_string );
+    my ($logon_string) = @_;
 
-    # strip off AS SYSDBA / AS SYSOPER first
-    if ( $arg =~ /^(.*)\s+as\s+sys(\w+)\s*$/i ) {
-        $ora_session_mode = 2  if lc($2) eq 'dba';
-        $ora_session_mode = 4  if lc($2) eq 'oper';
-        $arg              = $1 if $ora_session_mode;
-        $ora_session_mode = 0 unless $ora_session_mode;
+    my ($ora_session_mode, $username, $password, $connect_string);
+
+    if ($logon_string =~ /^(.*)\s+as\s+sys(\w+)\s*$/i) {
+        # strip off AS SYSDBA / AS SYSOPER first
+        $ora_session_mode = 2  if 'dba'  eq lc $2;
+        $ora_session_mode = 4  if 'oper' eq lc $2;
+        $logon_string     = $1 if $ora_session_mode;
+        $ora_session_mode ||= 0;
     }
-    if ( $arg =~ /^\/$/ ) {
+
+    if ($logon_string eq '/') {
         $username       = '';
         $password       = '';
         $connect_string = 'external';
-        return ( $ora_session_mode, $username, $password, $connect_string );
     }
-    elsif ( $arg eq 'internal' ) {
+    elsif ($logon_string eq 'internal') {
         $username         = '';
         $password         = '';
         $connect_string   = 'external';
         $ora_session_mode = 2;
-        return ( $ora_session_mode, $username, $password, $connect_string );
     }
-    elsif ( $arg =~ /^([^\/]+)\/([^\@]+)\@(.*)$/ ) {
-
-        #username/password@connect_string
+    elsif ($logon_string =~ m{^([^/]+)/([^\@]+)\@(.*)$}) {
+        # username/password@connect_string
         $username       = $1;
         $password       = $2;
         $connect_string = $3;
-        return ( $ora_session_mode, $username, $password, $connect_string );
     }
-    elsif ( $arg =~ /^([^\@]+)\@(.*)$/ ) {
-
+    elsif ($logon_string =~ m{^([^\@]+)\@(.*)$}) {
         # username@connect_string
         $username       = $1;
         $password       = '';
         $connect_string = $2;
-        return ( $ora_session_mode, $username, $password, $connect_string );
     }
-    elsif ( $arg =~ /^([^\/]+)\/([^\@]+)$/ ) {
-
+    elsif ($logon_string =~ m{^([^/]+)/([^\@]+)$}) {
         # username/password
         $username       = $1;
         $password       = $2;
         $connect_string = '';
-        return ( $ora_session_mode, $username, $password, $connect_string );
     }
-    elsif ( $arg =~ /^([^\/\@]+)$/ ) {
-
+    elsif ($logon_string =~ m{^([^/\@]+)$}) {
         # username
         $username       = $1;
         $password       = $2;
         $connect_string = '';
-        return ( $ora_session_mode, $username, $password, $connect_string );
     }
-    elsif ( $arg =~ /^\@(.*)$/ ) {
-
+    elsif ($logon_string =~ m{^\@(.*)$}) {
         # @connect_string
         $username       = '';
         $password       = '';
         $connect_string = $1;
-        return ( $ora_session_mode, $username, $password, $connect_string );
     }
     else {
-        return ( undef, undef, undef, undef );
+        return undef, undef, undef, undef;
     }
+
+    return $ora_session_mode, $username, $password, $connect_string;
 }
 
 sub populate_completion_list {
-    my ( $inline_print, $current_table_name ) = @_;
-    debugmsg( 3, "populate_completion_list called", @_ );
+    my ($inline_print, $current_table_name) = @_;
+    debugmsg (3, 'populate_completion_list called', @_);
 
     # grab all the table and column names and put them in @completion_list
 
     if ($inline_print) {
         $| = 1;
-        print STDERR "...";
+        print STDERR '...';
     }
     else {
         print STDERR "Generating auto-complete list...\n";
     }
 
-    if ( $conf{extended_complete_list} ) {
+    if ($conf{extended_complete_list}) {
         my @queries;
-        if ( $conf{complete_tables} ) {
-            push( @queries, 'select table_name from all_tables' );
-        }
-        if ( $conf{complete_columns} ) {
-            push( @queries, 'select column_name from all_tab_columns' );
-        }
-        if ( $conf{complete_objects} ) {
-            push( @queries, 'select object_name from all_objects' );
-        }
 
-        my $sqlstr = join( ' union ', @queries );
-        debugmsg( 3, "query: [$sqlstr]" );
+        push @queries, 'select table_name from all_tables'
+            if $conf{complete_tables};
 
-        my $sth = $dbh->prepare($sqlstr)
-            or query_err( 'prepare', $DBI::errstr, $sqlstr ), setup_sigs(),
-            return (0);
+        push @queries, 'select column_name from all_tab_columns'
+            if $conf{complete_columns};
+
+        push @queries, 'select object_name from all_objects'
+            if $conf{complete_objects};
+
+        my $sqlstr = join ' union ', @queries;
+        debugmsg (3, "query: [$sqlstr]");
+
+        my $sth = $dbh->prepare ($sqlstr)
+            or query_err ('prepare', $DBI::errstr, $sqlstr), setup_sigs (),
+            return 0;
+
         $sth->execute()
-            or query_err( 'execute', $DBI::errstr, $sqlstr ), setup_sigs(),
-            return (0);
-        while ( my $res = $sth->fetchrow_array() ) {
-            push( @completion_list, $res );
+            or query_err ('execute', $DBI::errstr, $sqlstr), setup_sigs (),
+            return 0;
+
+        while (my $res = $sth->fetchrow_array) {
+            push @completion_list, $res;
         }
     }
     else {
         my @queries;
-        if ( $conf{complete_tables} ) {
-            push( @queries,
-                "select 'table-' || table_name from user_tables" );
-        }
-        if ( $conf{complete_columns} ) {
-            push( @queries,
-                "select 'column-' || column_name from user_tab_columns" );
-        }
-        if ( $conf{complete_objects} ) {
-            push( @queries,
-                "select 'object-' || object_name from user_objects" );
-        }
 
-        my $sqlstr = join( ' union ', @queries );
-        debugmsg( 3, "query: [$sqlstr]" );
+        push @queries, q{select 'table-' || table_name from user_tables}
+            if $conf{complete_tables};
 
-        my $sth = $dbh->prepare($sqlstr)
-            or query_err( 'prepare', $DBI::errstr, $sqlstr ), setup_sigs(),
-            return (0);
-        $sth->execute()
-            or query_err( 'execute', $DBI::errstr, $sqlstr ), setup_sigs(),
-            return (0);
-        while ( my $res = $sth->fetchrow_array() ) {
-            push( @completion_list, $res );
+        push @queries, q{select 'column-' || column_name from user_tab_columns}
+            if $conf{complete_columns};
+
+        push @queries, q{select 'object-' || object_name from user_objects}
+            if $conf{complete_objects};
+
+        my $sqlstr = join ' union ', @queries;
+        debugmsg (3, "query: [$sqlstr]");
+
+        my $sth = $dbh->prepare ($sqlstr)
+            or query_err ('prepare', $DBI::errstr, $sqlstr), setup_sigs (),
+            return 0;
+
+        $sth->execute
+            or query_err ('execute', $DBI::errstr, $sqlstr), setup_sigs (),
+            return 0;
+
+        while (my $res = $sth->fetchrow_array) {
+            push @completion_list, $res;
         }
     }
 
-    if ( $conf{command_complete_list} ) {
-        push( @completion_list,
-            "command-create",  "command-select",      "command-insert",
-            "command-update",  "command-delete from", "command-from",
-            "command-execute", "command-show",        "command-describe",
-            "command-drop" );
-    }
+    push @completion_list, 'command-create',      'command-select',
+                           'command-insert',      'command-update',
+                           'command-delete from', 'command-from',
+                           'command-execute',     'command-show',
+                           'command-describe',    'command-drop'
+        if $conf{command_complete_list};
 
     if ($current_table_name) {
-
         my @queries;
 
-        #@completion_list = ();
-        push( @queries,
-            "select 'current_column-$current_table_name.' || column_name from user_tab_columns where table_name=\'"
-                . uc($current_table_name)
-                . "\'" );
+        push @queries, qq{
+            select 'current_column-$current_table_name.' || column_name
+            from   user_tab_columns
+            where  table_name='\U$current_table_name\E'
+        };
 
-        my $sqlstr = join( ' union ', @queries );
-        debugmsg( 3, "query: [$sqlstr]" );
+        my $sqlstr = join ' union ', @queries;
+        debugmsg (3, "query: [$sqlstr]");
 
-        my $sth = $dbh->prepare($sqlstr)
-            or query_err( 'prepare', $DBI::errstr, $sqlstr ), setup_sigs(),
-            return (0);
-        $sth->execute()
-            or query_err( 'execute', $DBI::errstr, $sqlstr ), setup_sigs(),
-            return (0);
-        while ( my $res = $sth->fetchrow_array() ) {
-            push( @completion_list, $res );
+        my $sth = $dbh->prepare ($sqlstr)
+            or query_err ('prepare', $DBI::errstr, $sqlstr), setup_sigs (),
+            return 0;
+
+        $sth->execute ()
+            or query_err ('execute', $DBI::errstr, $sqlstr), setup_sigs (),
+            return 0;
+
+        while (my $res = $sth->fetchrow_array) {
+            push @completion_list, $res;
         }
     }
 
-    setup_sigs();
+    setup_sigs ();
 
     if ($inline_print) {
         print "\r";
         print "[K";
         $| = 0;
-        $term->forced_update_display();
+        $term->forced_update_display;
     }
 }
 
@@ -812,17 +721,14 @@ sub complete_entry_function {
 }
 
 sub db_reconnect {
-    debugmsg( 3, "db_reconnect called", @_ );
+    debugmsg (3, 'db_reconnect called', @_);
 
     # This first disconnects the database, then tries to reconnect
 
     print "Reconnecting...\n";
-
-    commit_on_exit();
-
-    $dbh->disconnect() if defined $dbh;
-
-    $dbh = db_connect( 1, @dbparams );
+    commit_on_exit ();
+    $dbh->disconnect if defined $dbh;
+    $dbh = db_connect (1, @dbparams);
 }
 
 sub db_connect {
@@ -850,59 +756,32 @@ sub db_connect {
         "ora_session_mode: [$ora_session_mode] username: [$username] password: [$password] connect_string: [$connect_string]"
     );
 
-    # The first thing we're going to check is that the Oracle DBD is available
-    # since it's a sorta required element =)
-    my @drivers = DBI->available_drivers();
-    my $found   = 0;
-    foreach (@drivers) {
-        if ( $_ eq "Oracle" ) {
-            $found = 1;
-        }
-    }
-    unless ($found) {
-            err (
-            "Could not find DBD::Oracle... please install.  Available drivers: "
-            . join( ", ", @drivers )
-            . ".\n" );
-    }
-
-    #print "drivers: [" . join("|", @drivers) . "]\n";
-
-    # Now we can attempt a connection to the database
+    # Attempt a connection to the database
     my $attributes = {
         RaiseError       => 0,
         PrintError       => 0,
         AutoCommit       => $conf{auto_commit},
         LongReadLen      => $conf{long_read_len},
         LongTruncOk      => $conf{long_trunc_ok},
-        ora_session_mode => $ora_session_mode
+        ora_session_mode => $ora_session_mode,
     };
 
-    if ( $connect_string eq 'external' ) {
-
+    if ($connect_string eq 'external') {
         # the user wants to connect with external authentication
 
-        check_oracle_home();
+        check_oracle_home ();
 
-        # install alarm signal handle
-        $SIG{ALRM} = \&sighandle;
-        alarm( $conf{connection_timeout} );
-
-        if ( !$opt_batch ) {
-            print "Attempting connection to local database\n";
-        }
-        $dbhandle = DBI->connect( 'dbi:Oracle:', undef, undef, $attributes )
-            or do {
+        print "Attempting connection to local database\n" unless $opt_batch;
+        $dbhandle = DBI->connect ('DBI:Oracle:', undef, undef, $attributes);
+        unless ($dbhandle) {
             $dberr    = $DBI::err;
             $dberrstr = $DBI::errstr;
-            };
+        }
 
         $this_prompt_host = $ENV{ORACLE_SID};
         $this_prompt_user = $ENV{LOGNAME};
-        alarm(0);    # cancel alarm
     }
     elsif ($connect_string) {
-
         # We were provided with a connect string, so we can use the TNS method
 
         check_oracle_home();
@@ -919,15 +798,11 @@ sub db_connect {
             $userstring = $connect_string;
         }
 
-        # install alarm signal handle
-        $SIG{ALRM} = \&sighandle;
-        alarm( $conf{connection_timeout} );
-
         if ( !$opt_batch ) {
             print "Attempting connection to $userstring\n";
         }
         $dbhandle
-            = DBI->connect( 'dbi:Oracle:', $userstring, $password,
+            = DBI->connect( 'DBI:Oracle:', $userstring, $password,
             $attributes )
             or do {
             $dberr    = $DBI::err;
@@ -936,7 +811,6 @@ sub db_connect {
 
         $this_prompt_host = $connect_string;
         $this_prompt_user = $username;
-        alarm(0);    # cancel alarm
     }
     elsif ($opt_host) {
 
@@ -951,14 +825,10 @@ sub db_connect {
         $attributes->{ora_session_mode} = $ora_session_mode
             if $ora_session_mode;
 
-        # install alarm signal handle
-        $SIG{ALRM} = \&sighandle;
-        alarm( $conf{connection_timeout} );
-
         print "Attempting connection to $opt_host\n";
         debugmsg( 1, "dsn: [$dsn]" );
         $dbhandle
-            = DBI->connect( "dbi:Oracle:$dsn", $username, $password,
+            = DBI->connect( "DBI:Oracle:$dsn", $username, $password,
             $attributes )
             or do {
             $dberr    = $DBI::err;
@@ -968,7 +838,6 @@ sub db_connect {
         $this_prompt_host = $opt_host;
         $this_prompt_host = "$opt_sid!" . $this_prompt_host if $opt_sid;
         $prompt{user}     = $username;
-        alarm(0);    # cancel alarm
     }
     else {
         # attempt a connection without specifying a hostname or anything
@@ -979,13 +848,9 @@ sub db_connect {
         $attributes->{ora_session_mode} = $ora_session_mode
             if $ora_session_mode;
 
-        # install alarm signal handle
-        $SIG{ALRM} = \&sighandle;
-        alarm( $conf{connection_timeout} );
-
         print "Attempting connection to local database\n";
         $dbhandle
-            = DBI->connect( 'dbi:Oracle:', $username, $password, $attributes )
+            = DBI->connect( 'DBI:Oracle:', $username, $password, $attributes )
             or do {
             $dberr    = $DBI::err;
             $dberrstr = $DBI::errstr;
@@ -993,7 +858,6 @@ sub db_connect {
 
         $this_prompt_host = $ENV{ORACLE_SID};
         $this_prompt_user = $username;
-        alarm(0);    # cancel alarm
     }
 
     if ($dbhandle) {
@@ -1049,7 +913,7 @@ sub db_connect {
             err ("Could not connect to database: $dberrstr [$dberr]");
     }
     else {
-        wrn("Could not connect to database: $dberrstr [$dberr]");
+        wrn ("Could not connect to database: $dberrstr [$dberr]");
         return (0);
     }
 
@@ -1067,158 +931,113 @@ sub db_connect {
 
 sub get_prompt {
     my ($prompt_string) = @_;
-    debugmsg( 3, "get_prompt called", @_ );
+    debugmsg (3, 'get_prompt called', @_);
 
     # This returns a prompt.  It can be passed a string which will
     # be manually put into the prompt.  It will be padded on the left with
     # white space
 
-    $prompt_length ||= 5;    #just in case normal prompt hasn't been outputted
-    debugmsg( 2, "prompt_length: [$prompt_length]" );
+    $prompt_length ||= 5;    # just in case normal prompt hasn't been output
+    debugmsg (2, "prompt_length: [$prompt_length]");
 
     if ($prompt_string) {
-        my $temp_prompt
-            = sprintf( '%' . $prompt_length . 's', $prompt_string . '> ' );
-        return ($temp_prompt);
+        my $temp_prompt = sprintf "%${prompt_length}s", "$prompt_string> ";
+        return $temp_prompt;
     }
     else {
-        my $temp_prompt = $conf{prompt} . '> ';
-        my $temp_prompt_host = '@' . $prompt{host} if $prompt{host};
-        $temp_prompt =~ s/\%H/$temp_prompt_host/g;
-        $temp_prompt =~ s/\%U/$prompt{user}/g;
+        my $temp_prompt = "$conf{prompt}> ";
+        my $temp_prompt_host = '@'.$prompt{host} if $prompt{host};
+        $temp_prompt =~ s/%H/$temp_prompt_host/g;
+        $temp_prompt =~ s/%U/$prompt{user}/g;
 
-        $prompt_length = length($temp_prompt);
-        return ($temp_prompt);
+        $prompt_length = length $temp_prompt;
+        return $temp_prompt;
     }
 }
 
 sub get_up {
-    my ( $ora_session_mode, $username, $password ) = @_;
-    debugmsg( 3, "get_up called", @_ );
+    my ($ora_session_mode, $username, $password) = @_;
+    debugmsg (3, 'get_up called', @_);
 
-    if ( !$opt_batch ) {
+    unless ($opt_batch) {
+        setup_term () unless $term;
 
-        setup_term() unless $term;
-
-        # Get username/password
-        unless ($username) {
-
-            # prompt for the username
+        unless (defined $username) {
             $username = $term->readline('Username: ');
-            if ( $username =~ /^(.*)\s+as\s+sys(\w+)\s*$/i ) {
-                $ora_session_mode = 2 if lc($2) eq 'dba';
-                $ora_session_mode = 4 if lc($2) eq 'oper';
+
+            if ($username =~ /^(.*)\s+as\s+sys(\w+)\s*$/i) {
+                $ora_session_mode = 2 if 'dba'  eq lc $2;
+                $ora_session_mode = 4 if 'oper' eq lc $2;
                 $username         = $1;
             }
 
-            # Take that entry off of the history list
-            if ( $term_type eq 'gnu' ) {
-                $term->remove_history( $term->where_history() );
-            }
+            # Take the username off of the history list
+            $term->remove_history ($term->where_history) if $term_type eq 'gnu';
         }
 
-        unless ($password) {
-
-            # prompt for the password, and disable echo
+        unless (defined $password) {
+            # backup the original redisplay function
             my $orig_redisplay = $attribs->{redisplay_function};
-            $attribs->{redisplay_function} = \&shadow_redisplay;
+
+            # use a password-masking redisplay function
+            $attribs->{redisplay_function} = $attribs->{shadow_redisplay};
 
             $password = $term->readline('Password: ');
 
+            # restore the original redisplay function
             $attribs->{redisplay_function} = $orig_redisplay;
 
-            # Take that entry off of the history list
-            if ( $term->ReadLine eq "Term::ReadLine::Gnu" ) {
-                $term->remove_history( $term->where_history() );
-            }
+            # Take the password off of the history list
+            $term->remove_history ($term->where_history)
+                if $term->ReadLine eq 'Term::ReadLine::Gnu';
         }
     }
 
-    return ( $ora_session_mode, $username, $password );
-
+    return $ora_session_mode, $username, $password;
 }
 
 sub check_oracle_home {
-
-    # This checks for the ORACLE_HOME environment variable and dies if it's
-    # not set
-        err ("Please set your ORACLE_HOME environment variable!")
+    err ('Please set your $ORACLE_HOME environment variable!')
         unless $ENV{ORACLE_HOME};
-    return (1);
-}
-
-sub shadow_redisplay {
-
-    # The one provided in Term::ReadLine::Gnu was broken
-    #  debugmsg(2, "shadow_redisplay called", @_);
-    my $OUT   = $attribs->{outstream};
-    my $oldfh = select($OUT);
-    $| = 1;
-    select($oldfh);
-    print $OUT ( "\r", $attribs->{prompt} );
-    $oldfh = select($OUT);
-    $|     = 0;
-    select($oldfh);
-}
-
-sub print_non_print {
-    my ($string) = @_;
-
-    my @string = unpack( "C*", $string );
-    my $ret_string;
-    foreach (@string) {
-        if ( $_ >= 40 && $_ <= 176 ) {
-            $ret_string .= chr($_);
-        }
-        else {
-            $ret_string .= "<$_>";
-        }
-    }
-    return ($ret_string);
 }
 
 sub interface {
-    debugmsg( 3, "interface called", @_ );
+    debugmsg (3, 'interface called', @_);
 
     # this is the main program loop that handles all the user input.
     my $input;
-    my $prompt = get_prompt();
+    my $prompt = get_prompt ();
 
-    setup_sigs();
+    setup_sigs ();
 
     # Check if we were interactively called, or do we need to process STDIN
-    if ( -t STDIN ) {
-        while ( defined( $input = $term->readline($prompt) ) ) {
+    if (-t STDIN) {
+        while ( defined ($input = $term->readline ($prompt)) ) {
             $sigintcaught = 0;
-            $prompt = process_input( $input, $prompt ) || get_prompt();
-            setup_sigs();
+            $prompt = process_input ($input, $prompt) || get_prompt ();
+            setup_sigs ();
         }
     }
     else {
-        debugmsg( 3, "non-interactive",        @_ );
-        debugmsg( 3, "\$opt_batch=$opt_batch", @_ );
-        debugmsg( 3, "\$opt_batch=$opt_batch", @_ );
+        debugmsg (3, 'non-interactive',        @_);
+        debugmsg (3, "\$opt_batch=$opt_batch", @_);
 
-        # Send STDIN to process_input();
-        while (<STDIN>) {
-            process_input($_);
-        }
+        process_input ($_) while <STDIN>;
     }
 
-    quit( 0, undef, "\n" );
+    quit (0, undef, "\n");
 }
 
 sub process_input {
-    my ( $input, $prompt, $add_to_history ) = @_;
-    if ( !( defined($add_to_history) ) ) {
-        $add_to_history = 1;
-    }
-    debugmsg( 3, "process_input called", @_ );
+    debugmsg (3, 'process_input called', @_);
+
+    my ($input, $prompt, $add_to_history) = @_;
+
+    $add_to_history //= 1;
 
     my $nprompt;
-SWITCH: {
-        if ( !$qbuffer ) {
-
+    SWITCH: {
+        unless ($qbuffer) {
             # Commands that are only allowed if there is no current buffer
             $input =~ /^\s*(?:!|host)\s*(.*)\s*$/i
                 and system($1), last SWITCH;
@@ -1286,17 +1105,13 @@ SWITCH: {
             if ( $nprompt eq '' )
             ;    # use last prompt if nothing caught (blank line)
     }
-    if (  !$opt_batch
-        && $term->ReadLine eq "Term::ReadLine::Gnu"
-        && $input =~ /[^\s]/
-        && $input ne $last_history )
-    {
-        if ( !$opt_batch && $add_to_history ) {
-            $term->AddHistory($input);
-        }
-    }
+
+    $term->AddHistory($input)
+        if !$opt_batch && $term->ReadLine eq "Term::ReadLine::Gnu" &&
+            $input =~ /[^\s]/ && $input ne $last_history && $add_to_history;
+
     $last_history = $input;
-    return ($nprompt);
+    return $nprompt;
 }
 
 sub parse_input {
@@ -1416,14 +1231,6 @@ sub parse_input {
                 undef $extra;
             }
 
-           # check that Text::CSV_XS is installed if a < redirection was given
-            if ( $op eq '<' && $notextcsv ) {
-                soft_err(
-                    "You must install Text::CSV_XS from CPAN to use this feature"
-                );
-                return (0);
-            }
-
             # deduce the format from the terminator type
             my $format;
 
@@ -1449,7 +1256,7 @@ sub parse_input {
             }
             $num_rows ||= 0;
 
-            debugmsg( 4, "fbuffer: [$fbuffer]\n" );
+            debugmsg( 4, "fbuffer: [$fbuffer]" );
 
      # if there is nothing in the buffer, then we assume that the user just
      # wants to reexecute the last query, which we have saved in $last_qbuffer
@@ -1500,7 +1307,7 @@ sub parse_input {
                                 . ( $count + 1 )
                                 . " of file '$op_text'\n";
                             $result_output = 0;
-                            close_csv();
+                            close_csv ();
                             last;
                         }
 
@@ -1550,37 +1357,23 @@ sub parse_input {
                 }
             }
             else {
-                query_err( 'Query', 'No current query in buffer' );
+                query_err ('Query', 'No current query in buffer');
             }
 
-            undef($qbuffer);
-            undef($fbuffer);
+            undef $qbuffer;
+            undef $fbuffer;
             $inplsqlblock = 0;
             $increate     = 0;
 
-            if ($extra) {
-                return ( parse_input($extra) );
-            }
-            else {
-                # return a 'new' prompt
-                return ( get_prompt() );
-            }
+            return $extra ? parse_input ($extra) : get_prompt ();
         }
     }
 
-    $qbuffer .= $input . "\n";
+    $qbuffer .= "$input\n";
 
-    debugmsg( 4, "qbuffer: [$qbuffer], input: [$input]" );
+    debugmsg (4, "qbuffer: [$qbuffer], input: [$input]");
 
-    if ($inquotes) {
-        return ( get_prompt($quote) );
-    }
-    elsif ($incomment) {
-        return ( get_prompt('DOC') );
-    }
-    else {
-        return ( get_prompt('-') );
-    }
+    return get_prompt ($inquotes ? $quote : ($incomment ? 'DOC' : '-'));
 }
 
 sub get_csv_file {
@@ -1641,44 +1434,42 @@ sub get_csv_file {
 }
 
 sub close_csv {
-    close(CSV) || err ("Could not close CSV filehandle: $!");
-    $csv_filehandle_open = 0;
-    $csv_max_lines       = 0;
+    close CSV or err ("Could not close CSV filehandle: $!");
+    $csv_filehandle_open = $csv_max_lines = 0;
 }
 
 sub connect_cmd {
     my ($arg) = @_;
-    debugmsg( 3, "connect_cmd called", @_ );
+    debugmsg (3, 'connect_cmd called', @_);
 
     unless ($arg) {
-        wrn("Invalid connect syntax.  See help");
-        return (0);
+        wrn ('Invalid connect syntax. See help.');
+        return 0;
     }
 
-    my ( $ora_session_mode, $username, $password, $connect_string )
-        = parse_logon_string($arg);
+    my ($ora_session_mode, $username, $password, $connect_string)
+        = parse_logon_string ($arg);
 
-    my $new_dbh = db_connect( 0, $ora_session_mode, $username, $password,
-        $connect_string );
-    if ($new_dbh) {
-        print "Closing last connection...\n";
-        commit_on_exit();
+    my $new_dbh = db_connect (0, $ora_session_mode,
+                                 $username, $password, $connect_string);
+    return unless $new_dbh;
 
-        $dbh->disconnect() if defined $dbh;
-        $dbh       = $new_dbh;
-        $connected = 1;
-    }
+    print "Closing last connection...\n";
+    commit_on_exit ();
 
+    $dbh->disconnect if defined $dbh;
+    $dbh = $new_dbh;
+    $connected = 1;
 }
 
 sub disconnect_cmd {
-    debugmsg( 3, "disconnect_cmd called", @_ );
+    debugmsg (3, 'disconnect_cmd called', @_);
 
     if ($connected) {
         print "Closing last connection...\n";
-        commit_on_exit();
+        commit_on_exit ();
 
-        $dbh->disconnect() if ( defined $dbh );
+        $dbh->disconnect if defined $dbh;
         $connected = 0;
     }
     else {
@@ -1687,16 +1478,16 @@ sub disconnect_cmd {
 }
 
 sub commit_cmd {
-    debugmsg( 3, "commit_cmd called", @_ );
+    debugmsg (3, 'commit_cmd called', @_);
 
-    # this just called commit
+    # this just calls commit
 
-    if ( defined $dbh ) {
-        if ( $dbh->{AutoCommit} ) {
-            wrn("commit ineffective with AutoCommit enabled");
+    if (defined $dbh) {
+        if ($dbh->{AutoCommit}) {
+            wrn ('commit ineffective with AutoCommit enabled');
         }
         else {
-            $dbh->commit();
+            $dbh->commit;
             print "Transaction committed\n";
         }
     }
@@ -1706,16 +1497,16 @@ sub commit_cmd {
 }
 
 sub rollback_cmd {
-    debugmsg( 3, "rollback_cmd called", @_ );
+    debugmsg (3, 'rollback_cmd called', @_);
 
-    # this just called commit
+    # this just calls rollback
 
-    if ( defined $dbh ) {
-        if ( $dbh->{AutoCommit} ) {
-            wrn("rollback ineffective with AutoCommit enabled");
+    if (defined $dbh) {
+        if ($dbh->{AutoCommit}) {
+            wrn('rollback ineffective with AutoCommit enabled');
         }
         else {
-            $dbh->rollback();
+            $dbh->rollback;
             print "Transaction rolled back\n";
         }
     }
@@ -1726,102 +1517,76 @@ sub rollback_cmd {
 
 sub exec_cmd {
     my ($sqlstr) = @_;
-    debugmsg( 3, "exec_cmd called", @_ );
+    debugmsg (3, 'exec_cmd called', @_);
 
     # Wrap the statement in BEGIN/END and execute
 
-    $sqlstr = qq(
-    BEGIN
-      $sqlstr
-    END;
-  );
-
-    query( $sqlstr, 'table' );
+    query ("BEGIN $sqlstr END;", 'table');
 }
 
 sub edit {
     my ($filename) = @_;
-    debugmsg( 3, "edit called", @_ );
+    debugmsg (3, 'edit called', @_);
 
-   # This writes the current qbuffer to a file then opens up an editor on that
-   # file... when the editor returns, we read in the file and overwrite the
-   # qbuffer with it.  If there is nothing in the qbuffer, and there is
-   # something in the last_qbuffer, then we use the last_qbuffer.  If nothing
-   # is in either, then we just open the editor with a blank file.
+    # This writes the current qbuffer to a file then opens up an editor on that
+    # file... when the editor returns, we read in the file and overwrite the
+    # qbuffer with it.  If there is nothing in the qbuffer, and there is
+    # something in the last_qbuffer, then we use the last_qbuffer.  If nothing
+    # is in either, then we just open the editor with a blank file.
 
-    my $passed_file = 1 if $filename;
+    my $passed_file = !!$filename;
     my $filecontents;
-    my $prompt = get_prompt();
+    my $prompt = get_prompt ();
 
-    debugmsg( 2, "passed_file: [$passed_file]" );
+    debugmsg (2, "passed_file: [$passed_file]");
 
     if ($qbuffer) {
-        debugmsg( 2, "Using current qbuffer for contents" );
+        debugmsg (2, 'Using current qbuffer for contents');
         $filecontents = $qbuffer;
     }
     elsif ($last_qbuffer) {
-        debugmsg( 2, "Using last_qbuffer for contents" );
+        debugmsg (2, 'Using last_qbuffer for contents');
         $filecontents = $last_qbuffer . $last_fbuffer;
     }
     else {
-        debugmsg( 2, "Using blank contents" );
-        $filecontents = "";
+        debugmsg (2, 'Using blank contents');
+        $filecontents = '';
     }
 
-    debugmsg( 3, "filecontents: [$filecontents]" );
+    debugmsg (3, "filecontents: [$filecontents]");
 
     # determine the tmp directory
-    my $tmpdir;
-    if ( $ENV{TMP} ) {
-        $tmpdir = $ENV{TMP};
-    }
-    elsif ( $ENV{TEMP} ) {
-        $tmpdir = $ENV{TEMP};
-    }
-    elsif ( -d "/tmp" ) {
-        $tmpdir = "/tmp";
-    }
-    else {
-        $tmpdir = ".";
-    }
+    my $tmpdir = $ENV{TMP} || $ENV{TEMP} || (-d '/tmp' ? '/tmp' : '.');
 
-    # determine the preferred editor
-    my $editor;
-    if ( $ENV{EDITOR} ) {
-        $editor = $ENV{EDITOR};
-    }
-    else {
-        $editor = "vi";
-    }
+    # determine preferred editor
+    my $editor = $ENV{EDITOR} || `which nvim` || `which vim` || `which vi` ||
+                 `which nano` || 'ed';
 
     # create the filename, if not given one
-    $filename ||= "$tmpdir/yasql_" . int( rand(1000) ) . "_$$.sql";
+    $filename ||= "$tmpdir/yasql_".int (rand 1000)."_$$.sql";
 
     # expand the filename
-    ($filename) = glob($filename);
+    ($filename) = glob $filename;
 
-    debugmsg( 1, "Editing $filename with $editor" );
+    debugmsg (1, "Editing $filename with $editor");
 
-    # check for file existance.  If it exists, then we open it up but don't
-    # write the buffer to it
+    # check for file existance
+    # If it exists, then we open it up but don't write the buffer to it
     my $file_exists;
     if ($passed_file) {
-
         # if the file was passed, then check for it's existance
-        if ( -e $filename ) {
-
+        if (-e $filename) {
             # The file was found
             $file_exists = 1;
         }
-        elsif ( -e "$filename.sql" ) {
-
+        elsif (-e "$filename.sql") {
             # the file was found with a .sql extension
             $filename    = "$filename.sql";
             $file_exists = 1;
         }
         else {
-            wrn("$filename was not found, creating new file, which will not be "
-                    . "deleted" );
+            wrn ("$filename was not found, creating new file,".
+                 " which will not be deleted" );
         }
     }
     else {
@@ -1829,79 +1594,67 @@ sub edit {
         # don't care if it exists, since there's no way another process could
         # write to the same file at the same time since we use the PID in the
         # filename.
-        my $ret = open( TMPFILE, ">$filename" );
-        if ( !$ret ) {    #if file was NOT opened successfully
-            wrn("Could not write to $filename: $!");
+        my $ret = open TMPFILE, ">$filename";
+        unless ($ret) {
+            wrn ("Could not write to $filename: $!");
         }
         else {
             print TMPFILE $filecontents;
-            close(TMPFILE);
+            close TMPFILE;
         }
     }
 
     # now spawn the editor
-    my ( $ret, @filecontents );
-    debugmsg( 2, "Executing $editor $filename" );
-    $ret = system( $editor, "$filename" );
-    if ($ret) {
-        debugmsg( 2, "Executing env $editor $filename" );
-        $ret = system( "env", $editor, "$filename" );
-    }
-    if ($ret) {
-        debugmsg( 2, "Executing `which $editor` $filename" );
-        $ret = system( "`which $editor`", "$filename" );
-    }
+    my ($ret, @filecontents);
 
-    if ($ret) {    #if the editor or system returned a positive return value
-        wrn("Editor exited with $ret: $!");
+    debugmsg (2, "Executing $editor $filename");
+    $ret = system $editor, $filename;
+
+    if ($ret) {
+        # if the editor or system returned a positive return value
+        wrn ("Editor exited with $ret: $!");
     }
     else {
-        # read in the tmp file and apply it's contents to the buffer
-        my $ret = open( TMPFILE, "$filename" );
-        if ( !$ret ) {    # if file was NOT opened successfully
-            wrn("Could not read $filename: $!");
+        # read in the tmp file and apply its contents to the buffer
+
+        my $ret = open TMPFILE, $filename;
+        unless ($ret) {
+            wrn ("Could not read $filename: $!");
         }
         else {
             # delete our qbuffer and reset the inquotes var
-            $qbuffer      = "";
-            $inquotes     = 0;
-            $increate     = 0;
-            $inplsqlblock = 0;
-            $incomment    = 0;
-            while (<TMPFILE>) {
-                push( @filecontents, $_ );
-            }
-            close(TMPFILE);
+
+            $qbuffer  = '';
+            $inquotes = $increate = $inplsqlblock = $incomment = 0;
+
+            push @filecontents, $_ while <TMPFILE>;
+
+            close TMPFILE;
         }
     }
 
     if (@filecontents) {
-        print "\n";
-        print join( '', @filecontents );
-        print "\n";
+        print "\n@filecontents\n";
 
         foreach my $line (@filecontents) {
-
             # chomp off newlines
-            chomp($line);
+            chomp $line;
 
             last if $sigintcaught;
 
             # now send it in to process_input
             # and don't add lines of the script to command history
-            $prompt = process_input( $line, '', 0 );
+            $prompt = process_input ($line, '', 0);
         }
     }
 
     unless ($passed_file) {
-
         # delete the tmp file
-        debugmsg( 1, "Deleting $filename" );
-        unlink("$filename")
-            || wrn("Could not unlink $filename: $!");
+        debugmsg (1, "Deleting $filename");
+        unlink $filename or wrn ("Could not unlink $filename: $!");
     }
 
-    return ($prompt);
+    return $prompt;
 }
 
 sub run_script {
@@ -1939,7 +1692,7 @@ sub run_script {
     my $ret = open( SCRIPT, $file );
     if ( !$ret ) {    # if file was NOT opened successfully
         wrn("Could not read $file: $!");
-        $prompt = get_prompt();
+        $prompt = get_prompt ();
     }
     else {
         # read in the script
@@ -1961,32 +1714,28 @@ sub run_script {
 }
 
 sub show_qbuffer {
-    debugmsg( 3, "show_qbuffer called", @_ );
+    debugmsg (3, 'show_qbuffer called', @_);
 
     # This outputs the current buffer
 
-    #print "\nBuffer:\n";
     if ($qbuffer) {
-        print $qbuffer;
+        print "$qbuffer\n";
     }
     else {
-        print STDERR "Buffer empty";
+        print STDERR "Buffer empty\n";
     }
-    print "\n";
 }
 
 sub clear_qbuffer {
-    debugmsg( 3, "clear_qbuffer called", @_ );
+    debugmsg (3, 'clear_qbuffer called', @_);
 
     # This clears the current buffer
 
-    $qbuffer      = '';
-    $inquotes     = 0;
-    $inplsqlblock = 0;
-    $increate     = 0;
-    $incomment    = 0;
+    $qbuffer  = '';
+    $inquotes = $inplsqlblock = $increate = $incomment = 0;
     print "Buffer cleared\n";
-    return ( get_prompt() );
+
+    return get_prompt ();
 }
 
 sub debug_toggle {
@@ -2018,18 +1767,12 @@ sub debug_toggle {
 }
 
 sub autocommit_toggle {
-    debugmsg( 3, "autocommit_toggle called", @_ );
+    debugmsg (3, 'autocommit_toggle called', @_);
 
-    # autocommit is turned off if on on if off
+    # autocommit is turned off if on, and on if off
+    $dbh->{AutoCommit} = $dbh->{AutoCommit} ? 0 : 1;
 
-    if ( $dbh->{AutoCommit} ) {
-        $dbh->{AutoCommit} = 0;
-    }
-    else {
-        $dbh->{AutoCommit} = 1;
-    }
-
-    print "AutoCommit is now " . ( $dbh->{AutoCommit} ? 'on' : 'off' ) . "\n";
+    print 'AutoCommit is now '.($dbh->{AutoCommit} ? 'on' : 'off')."\n";
 }
 
 sub show {
@@ -2884,9 +2627,9 @@ sub describe {
     $input = lc($input);
 
     # make sure we're still connected to the database
-    unless ( ping() ) {
-        wrn("Database connection died");
-        db_reconnect();
+    unless (ping ()) {
+        wrn ('Database connection died');
+        db_reconnect ();
     }
 
     # parse the query to find the table that was requested to be described
@@ -2933,13 +2676,16 @@ sub describe {
                 my $scale     = $sth->{SCALE};
                 my $nullable  = $sth->{NULLABLE};
 
-                debugmsg( 4, "fields: [" . join( ',', @$fields ) . "]" );
-                debugmsg( 4, "types: [" . join( ',', @$types ) . "]" );
-                debugmsg( 4, "type_info: [" . Dumper($type_info) . "]" );
-                debugmsg( 4,
-                    "precision: [" . join( ',', @$precision ) . "]" );
-                debugmsg( 4, "scale: [" . join( ',', @$scale ) . "]" );
-                debugmsg( 4, "nullable: [" . join( ',', @$nullable ) . "]" );
+                {
+                    local $" = ',';
+
+                    debugmsg (4, "fields: [@$fields]");
+                    debugmsg (4, "types: [@$types]");
+                    debugmsg (4, 'type_info: ['.debugdump ($type_info).']');
+                    debugmsg (4, "precision: [@$precision]");
+                    debugmsg (4, "scale: [@$scale]");
+                    debugmsg (4, "nullable: [@$nullable]");
+                }
 
                 # Assemble a multidiminsional array of the output
                 my @desc;
@@ -3319,24 +3065,34 @@ sub describe {
 
 sub set_cmd {
     my ($input) = @_;
-    debugmsg( 3, "set_cmd called", @_ );
+    debugmsg (3, 'set_cmd called', @_);
 
-   # This mimics SQL*Plus set commands, or ignores them completely.  For those
-   # that are not supported, we do nothing at all, but return silently.
+    # This mimics SQL*Plus set commands, or ignores them completely. For those
+    # that are not supported, we do nothing at all, but return silently.
 
-    if ( $input
-        =~ /^\s*set\s+serverout(?:put)?\s+(on|off)(?:\s+size\s+(\d+))?/i )
-    {
-        if ( lc($1) eq 'on' ) {
+    my $serverout_re = qr/^
+        \s* set
+        \s+ serverout(?:put)?
+        \s+ (on | off)
+        (?:
+            \s+ size
+            \s+ (\d+)
+        )?
+    /ix;
+
+    if ($input =~ $serverout_re) {
+        if ('on' eq lc $1) {
             my $size = $2 || 1_000_000;
-            debugmsg( 2, "calling dbms_output_enable($size)" );
-            $dbh->func( $size, 'dbms_output_enable' );
+
+            debugmsg (2, "calling dbms_output_enable($size)");
+            $dbh->func ($size, 'dbms_output_enable');
+
             $set{serveroutput} = 1;
-            debugmsg( 2, "serveroutput set to $set{serveroutput}" );
+            debugmsg (2, "serveroutput set to $set{serveroutput}");
         }
         else {
             $set{serveroutput} = 0;
-            debugmsg( 2, "serveroutput set to $set{serveroutput}" );
+            debugmsg (2, "serveroutput set to $set{serveroutput}");
         }
     }
 }
@@ -3373,9 +3129,9 @@ sub query {
         $running_query = 1;
 
         # make sure we're still connected to the database
-        unless ( ping() ) {
-            wrn("Database connection died");
-            db_reconnect();
+        unless (ping ()) {
+            wrn ('Database connection died');
+            db_reconnect ();
         }
 
         $sqlstr = wildcard_expand($sqlstr) if $conf{column_wildcards};
@@ -3451,7 +3207,7 @@ sub query {
 
         finish_query($sth), return () if $sigintcaught;    #pseudo sig handle
 
-        debugmsg( 1, "rows returned: [" . $sth->rows() . "]" );
+        debugmsg( 1, "rows returned: [" . $sth->rows . "]" );
 
         # open the redirection file
         if ( $op && $op eq '>' || $op eq '>>' ) {
@@ -3479,7 +3235,7 @@ sub query {
             open( FOUT, ">&STDOUT" );
         }
 
-        # Output message is serveroutput is on
+        # Output message if serveroutput is on
         if ( $set{serveroutput} ) {
             debugmsg( 3, "Calling dmbs_output_get" );
             my @output = $dbh->func('dbms_output_get');
@@ -3597,53 +3353,29 @@ sub finish_query {
     # This just finishes the query and cleans up the state info
 
     $sth->finish;
-    undef($cursth);
+    undef $cursth;
     $running_query = 0;
-    setup_sigs();
+
+    setup_sigs ();
 }
 
 sub get_bench {
-    debugmsg( 3, "get_bench called", @_ );
+    debugmsg (3, 'get_bench called', @_);
 
     # returns benchmark info
-
-    my ( $benchmark, $hires );
-    $benchmark = new Benchmark;
-
-    if ($nohires) {
-        $hires = time;
-    }
-    else {
-        # use an eval to keep perl from syntax checking it unless we have the
-        # Time::HiRes module loaded
-        eval q{
-      $hires = [gettimeofday]
-    };
-    }
-
-    return ( $benchmark, $hires );
+    return Benchmark->new, [gettimeofday];
 }
 
 sub output_benchmark {
-    my ( $string, $bstart, $hrstart, $bend, $hrend, $string2 ) = @_;
-    debugmsg( 3, "output_benchmark called", @_ );
+    my ($string, $bstart, $hrstart, $bend, $hrend, $string2) = @_;
+    debugmsg (3, 'output_benchmark called', @_);
 
     # This just outputs the benchmark info
 
-    my $bench = timediff( $bend, $bstart );
+    my $bench = timediff $bend, $bstart;
+    my $time = sprintf '%.2f', tv_interval $hrstart, $hrend;
 
-    my $time;
-    if ($nohires) {
-
-        # the times will be seconds
-        $time = $hrend - $hrstart;
-    }
-    else {
-        eval q{$time = tv_interval($hrstart, $hrend)};
-        $time = sprintf( "%.2f", $time );
-    }
-
-    unless ( $opt_bench || $conf{extended_benchmarks} ) {
+    unless ($opt_bench || $conf{extended_benchmarks}) {
 
         # convert $time to something more readable
         $time =~ s/\.(\d+)$//;
@@ -3689,14 +3421,15 @@ sub format_output {
     debugmsg( 3, "format_output called", @_ );
 
 # Formats the output according to the query terminator.  If it was a ';' or
-# a '/' then a normal table is output.  If it was a '\g' then all the columns   # and rows are output put line by line.
+# a '/' then a normal table is output.  If it was a '\g' then all the columns
+# and rows are output put line by line.
 # input:  $sth $format
 #         sth is the statement handler
 #         format can be either 'table', 'list', or 'list_aligned'
-# output: returns 0 on error, ($success_code, $rows_affected) on success
-#         $success_code = ('select', 'affected');
+# output: returns 0 on error, ($rows_affected, $success_code) on success
+#         $success_code may be one of qw(select affected);
 
-    debugmsg( 3, "type: [" . Dumper( $sth->{TYPE} ) . "]" );
+    debugmsg (3, 'type: ['.debugdump ($sth->{TYPE}).']');
 
     # Is this query a select?
     my $isselect = 1 if $sqlstr =~ /^\s*select/i;
@@ -3748,9 +3481,9 @@ sub format_output {
         my $types    = $sth->{TYPE};
         my $nullable = $sth->{NULLABLE};
 
-        debugmsg( 4, "fields: [" . Dumper($fields) . "]" );
-        debugmsg( 4, "types: [" . Dumper($types) . "]" );
-        debugmsg( 4, "nullable: [" . Dumper($nullable) . "]" );
+        debugmsg (4, 'fields: ['  .debugdump ($fields  ).']');
+        debugmsg (4, 'types: ['   .debugdump ($types   ).']');
+        debugmsg (4, 'nullable: ['.debugdump ($nullable).']');
 
         return (0) if $sigintcaught;        #pseudo sig handle
 
@@ -3934,29 +3667,27 @@ sub format_output {
         print FOUT "\n";
 
         my $maxwidth = 0;
-        for ( my $i = 0; $i < @$fields; $i++ ) {
-            my $len = length( $fields->[$i] ) + 1;    # +1 for the colon
-            $maxwidth = $len if $len >= $maxwidth;
+        for (my $i = 0; $i < @$fields; ++$i) {
+            my $len = length $fields->[$i];
+            $maxwidth = $len if $len > $maxwidth;
         }
 
-        return (0) if $sigintcaught;                  #pseudo sig handle
+        return 0 if $sigintcaught;                  # pseudo sig handle
 
         my $count = 0;
-        while ( my $res = $sth->fetch() ) {
-            print FOUT "\n**** Row: " . ( $count + 1 ) . "\n";
-            for ( my $i = 0; $i < @$fields; $i++ ) {
+        while (my $res = $sth->fetch) {
+            printf FOUT "\n**** Row: %u\n", $count + 1;
+            for (my $i = 0; $i < @$fields; ++$i) {
                 my $data = $res->[$i];
-                $data = 'NULL' unless defined $data;
-                print FOUT
-                    sprintf( "%-" . $maxwidth . "s", $fields->[$i] . ":" );
-                print FOUT " " . $data . "\n";
+                $data //= 'NULL';
+                printf FOUT "%*s: %s\n", $maxwidth, $fields->[$i], $data;
             }
-            $count++;
+            ++$count;
             last if $num_rows && $count >= $num_rows;
-            return (0) if $sigintcaught;    #pseudo sig handle
+            return 0 if $sigintcaught;    # pseudo sig handle
         }
 
-        return (0) if $sigintcaught;        #pseudo sig handle
+        return 0 if $sigintcaught;        # pseudo sig handle
 
     # If we didn't get any rows back, then the query was probably an insert or
     # update, so we call format_affected
@@ -3991,47 +3722,36 @@ sub format_output {
         print "\r[K" if $op eq '<';
         print FOUT "\n";
 
-        # check that Text::CSV_XS was included ok, if not output an error
-        if ($notextcsv) {
-            soft_err(
-                "You must install Text::CSV_XS from CPAN to use this feature"
-            );
-            return (0);
+        my $fields = $sth->{NAME};
+
+        if ( $format eq 'csv' ) {
+
+            # Print the column headers
+            for ( my $i = 0; $i < @$fields; $i++ ) {
+                print FOUT "," if $i > 0;
+                print FOUT $fields->[$i];
+            }
+            print FOUT "\n";
         }
-        else {
-            my $fields = $sth->{NAME};
 
-            if ( $format eq 'csv' ) {
+        my $count = 0;
+        while ( my $res = $sth->fetch() ) {
+            $count++;
 
-                # Print the column headers
-                for ( my $i = 0; $i < @$fields; $i++ ) {
-                    print FOUT "," if $i > 0;
-                    print FOUT $fields->[$i];
-                }
-                print FOUT "\n";
-            }
+            $csv->combine(@$res);
+            print FOUT $csv->string() . "\n";
 
-            my $count = 0;
-            while ( my $res = $sth->fetch() ) {
-                $count++;
-
-                $csv->combine(@$res);
-                print FOUT $csv->string() . "\n";
-
-                last if $num_rows && $count >= $num_rows;
-                return (0) if $sigintcaught;    #pseudo sig handle
-            }
-
-            return (0) if $sigintcaught;        #pseudo sig handle
-
-    # If we didn't get any rows back, then the query was probably an insert or
-    # update, so we call format_affected
-            if ( $count <= 0 && !$isselect ) {
-                return ( $sth->rows(), 'affected' );
-            }
-
-            return ( $count, 'selected' );
+            last if $num_rows && $count >= $num_rows;
+            return (0) if $sigintcaught;    #pseudo sig handle
         }
+
+        return (0) if $sigintcaught;        #pseudo sig handle
+
+        # If we didn't get any rows back, then the query was probably
+        # an insert or update, so we call format_affected
+        return $sth->rows, 'affected' if $count <= 0 && !$isselect;
+
+        return $count, 'selected';
     }
     elsif ( $format eq 'sql' ) {
 
@@ -4106,187 +3826,157 @@ sub format_affected {
 }
 
 sub statusline {
-    my ( $num, $max ) = @_;
-    debugmsg( 3, "statusline called", @_ );
-    my $linewidth;
-    eval q{
-    use Term::ReadKey;
-    (\$linewidth) = GetTerminalSize();
-  };
-    if ($@) {
-        $linewidth = 80;
-    }
+    my ($num, $max) = @_;
+    debugmsg (3, 'statusline called', @_);
+
+    my ($linewidth) = GetTerminalSize;
+    $linewidth ||= 80;
+
     my $numwidth = length($num);
     my $maxwidth = length($max);
     my $width    = $linewidth - $numwidth - $maxwidth - 9;
 
-    my $fillnum  = ( ( $num / $max ) * $width );
-    my $spacenum = ( ( ( $max - $num ) / $max ) * $width );
+    my $fillnum  = ($num / $max) * $width;
+    my $spacenum = ( ($max - $num) / $max ) * $width;
 
-    if ( $fillnum =~ /\./ ) {
-        $fillnum = int($fillnum) + 1;
-    }
+    $fillnum  = int ($fillnum ) + 1 if $fillnum  =~ /\./;
+    $spacenum = int ($spacenum)     if $spacenum =~ /\./;
 
-    if ( $spacenum =~ /\./ ) {
-        $spacenum = int($spacenum);
-    }
+    my $fill  = '*' x $fillnum;
+    my $space = '-' x $spacenum;
+    my $pcnt  = sprintf '%.0d', $num / $max * 100;
 
-    my $fill  = ( '*' x $fillnum );
-    my $space = ( '-' x $spacenum );
-    my $pcnt  = sprintf( "%.0d", ( $num / $max * 100 ) );
-
-    return (
-        sprintf(
-            "%-" . $linewidth . "s",
-            "$num/$max [" . $fill . $space . "] $pcnt\%"
-            )
-            . "\r"
-    );
-}
-
-sub statusprint {
-    my ($string) = @_;
-
-    return ("\r[K$string\n");
+    return sprintf "%-${linewidth}s\r", "$num/$max [${fill}${space}] $pcnt%";
 }
 
 sub ping {
-    debugmsg( 3, "ping called", @_ );
-    if ( !$dbh ) {
-        return (0);
-    }
-    else {
-        # install alarm signal handle
-        $SIG{ALRM} = \&sighandle;
-        debugmsg( 2,
-            "Setting alarm for ping ($conf{connection_timeout} seconds)" );
-        alarm( $conf{connection_timeout} );
+    debugmsg (3, 'ping called', @_);
 
-        debugmsg( 2, "Pinging..." );
-        if ( $dbh->ping() ) {
-            debugmsg( 2, "Ping successfull" );
-            alarm(0);    # cancel alarm
-            return (1);
-        }
-        else {
-            debugmsg( 2, "Ping failed" );
-            alarm(0);    # cancel alarm
-            db_reconnect();
-            return (0);
-        }
+    return unless $dbh;
+
+    debugmsg (2, 'Pinging...');
+    if ($dbh->ping) {
+        debugmsg (2, 'Ping successfull');
+        return 1;
     }
-    alarm(0);            # cancel alarm
+
+    debugmsg (2, 'Ping failed');
+    return;
 }
 
 sub query_err {
-    my ( $query_type, $msg, $query ) = @_;
-    debugmsg( 3, "query_err called", @_ );
+    my ($query_type, $msg, $query) = @_;
+    debugmsg (3, 'query_err called', @_);
 
     # outputs a standard query error.  does not exit
     # input: $query_type, $msg, $query
 
-    chomp($query_type);
-    chomp($msg);
-    chomp($query);
+    chomp $query_type;
+    chomp $msg;
+    chomp $query;
 
-    print STDERR "\n";
-    print STDERR "$msg\n";
+    print STDERR "\n$msg\n";
     print STDERR "Query: $query\n" if $query && $conf{sql_query_in_error};
     print STDERR "\n";
 }
 
 sub err {
     my ($msg) = @_;
-    debugmsg( 3, "err called", @_ );
+    debugmsg (3, 'err called', @_);
 
     # outputs an error message and exits
-
-    print "Error: $msg\n";
-    quit(1);
+    print STDERR "Error: $msg\n";
+    quit (1);
 }
 
 sub soft_err {
     my ($msg) = @_;
-    debugmsg( 3, "soft_err called", @_ );
+    debugmsg (3, 'soft_err called', @_);
 
-    # outputs a error, but doesn't exit
-
-    print "\nError: $msg\n\n";
+    # outputs an error, but doesn't exit
+    print STDERR "\nError: $msg\n\n";
 }
 
 sub wrn {
     my ($msg) = @_;
-    debugmsg( 3, "wrn called", @_ );
+    debugmsg (3, 'wrn called', @_);
 
     # outputs a warning
-
     print STDERR "Warning: $msg\n";
 }
 
 sub quit {
-    my ( $exitcode, $force_quit, $msg ) = @_;
-    debugmsg( 3, "quit called", @_ );
+    my ($exitcode, $force_quit, $msg) = @_;
+    debugmsg (3, 'quit called', @_);
 
     # just quits
     $exitcode   ||= 0;
     $force_quit ||= 0;    # Set this to 1 to try a smoother force quit
-    $msg        ||= '';
+    $msg        //= '';
 
-    setup_sigs();
+    setup_sigs ();
 
-    print( $msg || '' ) if $msg && $msg ne "";
+    print $msg;
     $quitting = 1;
 
-    if ($force_quit) {
-        exit($exitcode);
-    }
+    exit $exitcode if $force_quit;
 
-    commit_on_exit();
+    commit_on_exit ();
 
     # disconnect the database
-    debugmsg( 1, "disconnecting from database" );
-    $dbh->disconnect() if defined $dbh;
+    debugmsg (1, 'disconnecting from database');
+    $dbh->disconnect if defined $dbh;
 
-    debugmsg( 1, "exiting with exitcode: [$exitcode]" );
-    exit($exitcode);
+    debugmsg (1, "exiting with exitcode: [$exitcode]");
+    exit $exitcode;
 }
 
 sub commit_on_exit {
-    debugmsg( 3, "commit_on_exit called", @_ );
+    debugmsg (3, 'commit_on_exit called', @_);
 
-    # Commit... or not
-    if ( $conf{commit_on_exit} && defined $dbh && !$dbh->{AutoCommit} ) {
+    return unless ping ();
 
+    # Commit... or omit.
+    if ($conf{commit_on_exit} && defined $dbh && !$dbh->{AutoCommit}) {
         # do nothing, oracle commits on disconnect
     }
-    elsif ( defined $dbh && !$dbh->{AutoCommit} ) {
+    elsif (defined $dbh && !$dbh->{AutoCommit}) {
         print "Rolling back any outstanding transaction...\n";
-        $dbh->rollback();
+        $dbh->rollback;
     }
 }
 
+sub debugdump {
+    my $dumper_output = Dumper @_;
+    chomp $dumper_output;
+    return $dumper_output;
+}
+
 sub debugmsg {
-    my ( $debuglevel, @msgs ) = @_;
+    my ($debuglevel, @msgs) = @_;
     $opt_debug ||= 0;
-    if ( $opt_debug >= $debuglevel ) {
-        my @time = localtime();
-        my $time = sprintf(
+    if ($opt_debug >= $debuglevel) {
+        my @time = localtime;
+        my $time = sprintf (
             "%.4i-%.2i-%.2i %.2i:%.2i:%.2i",
             $time[5] + 1900,
             $time[4] + 1,
-            $time[3], $time[2], $time[1], $time[0]
+            reverse @time[0..3],
         );
-        print STDERR "$time $debuglevel [" . join( "] [", @msgs ) . "]\n";
+
+        local $" = "] [";
+        print STDERR "$time $debuglevel [@msgs]\n";
     }
 }
 
 sub usage {
     my ($exit) = @_;
-    debugmsg( 3, "usage called", @_ );
+    debugmsg (3, 'usage called', @_);
 
     $exit ||= 0;
 
     print <<'_EOM_';
+
 Usage: yasql [options] [logon] [AS {SYSDBA|SYSOPER}] [@<file>[.ext]
          [<param1> <param2> ...]]
 Logon: <username>[/<password>][@<connect_string>] | /
@@ -4304,11 +3994,11 @@ Options:
 See the man pages for more help.
 _EOM_
 
-    exit(1) if $exit;
+    exit 1 if $exit;
 }
 
 sub help {
-    debugmsg( 3, "help called", @_ );
+    debugmsg (3, 'help called', @_);
 
     # This just outputs online help
 
@@ -4434,10 +4124,9 @@ Piping
 Please see 'man yasql' or 'perldoc yasql' for more help
 _EOM_
 
-    my $ret = open( PAGER, "|$conf{pager}" );
-    if ($ret) {
-        print PAGER $help;
-        close(PAGER);
+    if (open my $pager, '|-', '/usr/bin/env', $conf{pager}) {
+        print $pager $help;
+        close $pager;
     }
     else {
         print $help;
@@ -4682,19 +4371,15 @@ usability.
 
 =item Time::HiRes
 
-This is used for high resolution benchmarking.  It is optional.
+This is used for high resolution benchmarking.
 
-=item Text::CSV_XS
+=item Text::CSV
 
-This perl module is required if you want to output CSV or input from CSV files.
-If you don't plan on using this features, then you don't need to install this
-module.
+This perl module is required to output CSV or input from CSV files.
 
 =item Term::ReadKey
 
-This module is used for better input and output control.  Right now it isn't
-required, but some parts of YASQL will look and function better with this
-installed.
+This module is used for better input and output control.
 
 =back
 
@@ -4998,6 +4683,17 @@ Perltidy
 Use `our` instead of `use vars`
 Use `$1`, `$2`, ... instead of `\1`, `\2`, ...
 Do not force editors into specific modes
+unconditionally `use` modules
+`use Text::CSV` instead of `Text::CSV_XS`
+`ping` the DB before trying to `commit_on_exit`
+remove irrelevant `$SIG{__WARN__}` override
+remove `alarm`ing code, as we interoperate with XS code
+more rigorous attempts at finding your favourite editor
+remove unused subroutines
+consolidate redundant return statements
+more robust local paths
+getting rid of SelfLoader
+right-align field names for \G, a la MySQL client
 More changes
 
 Revision 1.83  2005/05/09 16:57:13  qzy
@@ -5423,4 +5119,3 @@ on the command line.  now whatever you put on the command line will overwrite
 the environment variable
 
 =cut
-
