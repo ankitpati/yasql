@@ -1,4 +1,3 @@
-# Generated automatically from Makefile.in by configure.
 INSTALL ?= /usr/bin/install -c
 SHELL ?= /bin/sh
 PERL ?= /usr/bin/perl
@@ -18,11 +17,11 @@ YASQL-VERSION-FILE:
 
 default: yasql yasql.1
 
-install : default
+install: default
 	${PERL} ./install.pl "${INSTALL}" ${bindir} ${mandir} ${sysconfdir}
 
-check : default
+check: default
 	./yasql --help > /dev/null
 
-clean :
+clean:
 	/bin/rm -f yasql yasql.1 YASQL-VERSION-FILE
