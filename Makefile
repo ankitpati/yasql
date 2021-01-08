@@ -17,7 +17,6 @@ YASQL-VERSION-FILE:
 default: yasql yasql.1
 
 install: default
-	mkdir -p "${bindir}" "${mandir}" "${sysconfdir}"
 	${PERL} ./install.pl ${INSTALL} "${bindir}" "${mandir}" "${sysconfdir}"
 
 check: default
