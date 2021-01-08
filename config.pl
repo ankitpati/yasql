@@ -4,7 +4,7 @@ use strict;
 use warnings;
 use autodie;
 
-use POD::Man;
+use Pod::Man;
 
 my ($perlpath, $bindir, $mandir, $sysconfdir, $version) = @ARGV;
 
