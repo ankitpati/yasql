@@ -9,10 +9,12 @@ use File::Path qw(make_path);
 my ($installpath, $bindir, $mandir, $sysconfdir) = @ARGV;
 
 print "Installing yasql to $bindir/yasql\n";
+make_path $bindir;
 system $installpath, qw(-m 755 yasql), "$bindir/yasql";
 
 unless (-e "$sysconfdir/yasql.conf") {
     print "Installing yasql.conf to $sysconfdir/yasql.conf\n";
+    make_path $sysconfdir;
     system $installpath, qw(-m 644 yasql.conf), "$sysconfdir/yasql.conf";
 }
 else {
@@ -26,7 +28,7 @@ if (-f "yasql.1") {
     system $installpath, qw(-m 644 yasql.1), "$mandir/man1/yasql.1";
 }
 else {
-    warn "yasql.1 not found, use perldoc $bindir/yasql to read the docs";
+    warn "yasql.1 not found, use perldoc $bindir/yasql to read the docs\n";
 }
 
 print "Installation successful.\n";
