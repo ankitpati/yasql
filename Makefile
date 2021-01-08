@@ -2,8 +2,7 @@ INSTALL ?= /usr/bin/install
 SHELL ?= /bin/sh
 PERL ?= /usr/bin/perl
 prefix ?= /usr/local
-exec_prefix = ${prefix}
-bindir = ${exec_prefix}/bin
+bindir = ${prefix}/bin
 mandir = ${prefix}/man
 sysconfdir = ${prefix}/etc
 
@@ -18,7 +17,8 @@ YASQL-VERSION-FILE:
 default: yasql yasql.1
 
 install: default
-	${PERL} ./install.pl "${INSTALL}" ${bindir} ${mandir} ${sysconfdir}
+	mkdir -p "${bindir}" "${mandir}" "${sysconfdir}"
+	${PERL} ./install.pl ${INSTALL} "${bindir}" "${mandir}" "${sysconfdir}"
 
 check: default
 	./yasql --help > /dev/null
