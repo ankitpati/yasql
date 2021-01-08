@@ -1,4 +1,4 @@
-INSTALL ?= /usr/bin/install -c
+INSTALL ?= /usr/bin/install
 SHELL ?= /bin/sh
 PERL ?= /usr/bin/perl
 prefix ?= /home/danielt/unix
