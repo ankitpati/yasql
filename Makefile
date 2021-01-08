@@ -1,7 +1,7 @@
 INSTALL ?= /usr/bin/install
 SHELL ?= /bin/sh
 PERL ?= /usr/bin/perl
-prefix ?= /home/danielt/unix
+prefix ?= /usr/local
 exec_prefix = ${prefix}
 bindir = ${exec_prefix}/bin
 mandir = ${prefix}/man
