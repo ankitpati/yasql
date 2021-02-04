@@ -1,10 +1,10 @@
-INSTALL ?= /usr/bin/install
-SHELL ?= /bin/sh
-PERL ?= /usr/bin/perl
-prefix ?= /usr/local
-bindir = ${prefix}/bin
-mandir = ${prefix}/man
-sysconfdir = ${prefix}/etc
+INSTALL ?= install
+SHELL ?= bash
+PERL ?= $(shell which perl)
+PREFIX ?= /usr/local
+bindir = ${PREFIX}/bin
+mandir = ${PREFIX}/man
+sysconfdir = ${PREFIX}/etc
 
 yasql yasql.1 : YASQL-VERSION-FILE
 	${PERL} ./config.pl ${PERL} ${bindir} ${mandir} \
@@ -23,4 +23,4 @@ check: default
 	./yasql --help > /dev/null
 
 clean:
-	/bin/rm -f yasql yasql.1 YASQL-VERSION-FILE
+	rm -f yasql yasql.1 YASQL-VERSION-FILE
