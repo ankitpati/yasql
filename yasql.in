@@ -71,7 +71,7 @@ our (
     $opt_headers,
 );
 
-$VERSION = '2.0';
+$VERSION = '2.01';
 
 select ((select (STDOUT), $| = 1)[0]);    # unbuffer STDOUT
 
@@ -3130,7 +3130,6 @@ sub describe {
 
                 # open the redirection file
                 if ($op && $op eq '>' || $op eq '>>') {
-                    ($op_text) = glob ($op_text);
                     debugmsg (3,
 "Opening file '$op_text' for output redirection using [$op]"
                     );
@@ -3139,7 +3138,6 @@ sub describe {
                         "Cannot open file '$op_text' for writing: $!", '');
                 }
                 elsif ($op eq '|') {
-                    ($op_text) = glob ($op_text);
                     open (FOUT, $op . $op_text)
                       || query_err ('pipe',
                         "Cannot open pipe '$op_text': $!", '');
@@ -3650,7 +3648,6 @@ sub query {
 
         # open the redirection file
         if ($op && $op eq '>' || $op eq '>>') {
-            ($op_text) = glob ($op_text);
             debugmsg (3,
                 "Opening file '$op_text' for output redirection using [$op]");
             open (FOUT, $op . $op_text) || do {
@@ -3661,7 +3658,6 @@ sub query {
             };
         }
         elsif ($op eq '|') {
-            ($op_text) = glob ($op_text);
             open (FOUT, $op . $op_text) || do {
                 query_err ('pipe', "Cannot open pipe '$op_text': $!", $sqlstr);
                 finish_query ($sth);
@@ -3686,7 +3682,7 @@ sub query {
         else {
             push (@formatbench, get_bench ()) if $conf{extended_benchmarks};
             ($rows_affected, $success_code) =
-              format_output ($sth, $format, $num_rows, $sqlstr, $op, $op_text)
+              format_output ($sth, $format, $num_rows, $sqlstr, $op)
               or finish_query ($sth), return ();
             push (@formatbench, get_bench ()) if $conf{extended_benchmarks};
             push (@totalbench,  get_bench ()) if !$conf{extended_benchmarks};
@@ -3853,7 +3849,7 @@ sub output_benchmark {
 }
 
 sub format_output {
-    my ($sth, $format, $num_rows, $sqlstr, $op, $op_text) = @_;
+    my ($sth, $format, $num_rows, $sqlstr, $op) = @_;
     debugmsg (3, "format_output called", @_);
 
    # Formats the output according to the query terminator.  If it was a ';' or
@@ -3868,7 +3864,7 @@ sub format_output {
     debugmsg (3, 'type: [' . debugdump ($sth->{TYPE}) . ']');
 
     # Is this query a select?
-    my $isselect = 1 if $sqlstr =~ /^\s*select/i;
+    my $isselect = $sqlstr =~ /^\s*select/i;
 
     if ($format eq 'table') {
         my $count    = 0;
@@ -5163,6 +5159,11 @@ will require some research to determine if it's even worth it.
 
 =head1 CHANGELOG
 
+Revision 2.01  2021/02/04 19:33:43  ankitpati
+remove useless globbing from redirection to fix deviation from docs (sort -n)
+remove useless paramater from `format_output`
+do not put `my` under `if` in `format_output`
+
 Revision 2.00  2017 to 2019  ankitpati
 Perltidy
 Use `our` instead of `use vars`
@@ -5179,7 +5180,6 @@ consolidate redundant return statements
 more robust local paths
 getting rid of SelfLoader
 right-align field names for \G, a la MySQL client
-incorporate changes from
 More changes
 
 Revision 1.83  2005/05/09 16:57:13  qzy

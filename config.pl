@@ -10,7 +10,7 @@ my ($perlpath, $bindir, $mandir, $sysconfdir, $version) = @ARGV;
 
 $perlpath   //= '/usr/bin/env perl';
 $sysconfdir //= '/usr/local/etc/';
-$version    //= '2.00';
+$version    //= '2.01';
 
 open my $yin,  '<', 'yasql.in';
 open my $yout, '>', 'yasql';
