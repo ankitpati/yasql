@@ -200,7 +200,7 @@ sub init {
     print STDERR <<"_EOC_" unless $opt_batch;
 
 YASQL version $VERSION Copyright (c)
-    2017-2018 Ankit Pati; 2000-2001 Ephibian, Inc; 2005 iMind.dev.
+    2017-2021 Ankit Pati; 2000-2001 Ephibian, Inc; 2005 iMind.dev.
 
 _EOC_
 
