@@ -4911,16 +4911,16 @@ Default: 0
 
 =item long_trunc_ok = [0/1]
 
-Long truncation OK.  If set to 1 then when a row contains a field that is
-set to a LONG time, such as BLOB, CLOB, etc will be truncated to long_read_len
-length.  If 0, then the row will be skipped and not outputted.
+Long truncation OK. If set to C<1>, when a row contains a field that is set to
+a C<LONG> type, such as C<BLOB>, C<CLOB>, etc., it will be truncated to
+C<long_read_len> length. If C<0>, the row will be skipped and not output.
 
 Default: 1
 
 =item long_read_len = <num_chars>
 
-Long Read Length.  This is the length of characters to truncate to if
-long_trunc_ok is on
+Long Read Length. This is the length of characters to truncate to if
+C<long_trunc_ok> is C<1>.
 
 Default: 80
 
