@@ -6,6 +6,7 @@
 #
 # Copyright (C) 2000 Ephibian, Inc.
 # Copyright (C) 2005 iMind.dev, Inc.
+# Copyright (C) 2017 Ankit Pati
 #
 # This program is free software; you can redistribute it and/or
 # modify it under the terms of the GNU General Public License
@@ -5042,8 +5043,10 @@ tested.
 
 Originaly written by Nathan Shafer (B<nshafer@ephibian.com>) with support from
 Ephibian, Inc.  http://www.ephibian.com
-Now it is mostly developed and maintained by Balint Kozman
+Then it was mostly developed and maintained by Balint Kozman
 (B<qzy@users.sourceforge.net>).  http://www.imind.hu
+Then, it was maintained on GitHub by Danijel Tasov, Robert Bohne, et. al.
+Now it is maintained by Ankit Pati (B<contact@ankitpati.in>).
 
 =head1 THANKS
 
@@ -5061,8 +5064,7 @@ on other platforms.
 
 =head1 COPYRIGHT
 
-Copyright (C) 2000-2002 Ephibian, Inc., 2005 iMind.dev.
-
+Copyright (C) 2000-2002 Ephibian, Inc., 2005 iMind.dev, 2017-2021 Ankit Pati.
 
 =head1 LICENSE
 
