@@ -1209,7 +1209,7 @@ sub parse_input {
         # PREMATCH, MATCH, POSTMATCH
         debugmsg (1, "parse: [$pre] [$match] [$post]");
 
-        if (($match eq '\'' || $match eq '"')) {
+        if (($match eq "'" || $match eq '"')) {
             if (!$quote || $quote eq $match) {
                 $inquotes = ($inquotes ? 0 : 1);
                 if ($inquotes) {
