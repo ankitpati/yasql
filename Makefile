@@ -3,7 +3,7 @@ SHELL ?= bash
 PERL ?= $(shell which perl)
 PREFIX ?= /usr/local
 bindir = ${PREFIX}/bin
-mandir = ${PREFIX}/man
+mandir = ${PREFIX}/share/man
 sysconfdir = ${PREFIX}/etc
 
 yasql yasql.1 : YASQL-VERSION-FILE
