@@ -34,11 +34,6 @@ The `ORACLE_HOME` environment variable must be set if you use a connection
 descriptor to connect so that YaSQL can translate the descriptor into useful
 connection information to make the actual connection.
 
-### `ORACLE_SID`
-
-The `ORACLE_SID` environment variable must be set unless you specify one with
-the `-s` option (refer to the POD).
-
 ### `Term::Readline`
 
 `Term::Readline` must be installed (it is with most Perl installations), but
