@@ -48,6 +48,10 @@ This is used for high resolution benchmarking.
 
 This module is used for better input and output control.
 
+### `Text::CSV`
+
+This module is used for CSV input and output.
+
 ## Installation
 
 * `make [options]`
